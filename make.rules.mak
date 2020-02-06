@@ -29,7 +29,7 @@ OPENSSL_LIB = $(OPENSSL_DIR)\lib\libeay32.lib
 !MESSAGE OpenSSL < 1.1.0 detected (dynamic library)
 !ELSE
 !MESSAGE OpenSSL >= 1.1.0 detected (dynamic library)
-OPENSSL_LIB = $(OPENSSL_DIR)\lib\libcrypto.lib
+OPENSSL_LIB = $(OPENSSL_DIR)\libcrypto.lib
 !ENDIF
 !ELSE
 OPENSSL_LIB = $(OPENSSL_DIR)\lib\VC\static\libeay32MT$(DEBUG_SUFFIX).lib
