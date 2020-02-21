@@ -40,6 +40,7 @@
 #include <openssl/objects.h>
 #include <openssl/engine.h>
 #include <openssl/ui.h>
+#include <openssl/x509v3.h>
 
 #define CMD_SO_PATH		ENGINE_CMD_BASE
 #define CMD_MODULE_PATH 	(ENGINE_CMD_BASE+1)
@@ -71,6 +72,10 @@ EVP_PKEY *ctx_load_pubkey(ENGINE_CTX *ctx, const char *s_key_id,
 
 EVP_PKEY *ctx_load_privkey(ENGINE_CTX *ctx, const char *s_key_id,
 	UI_METHOD * ui_method, void *callback_data);
+
+int ctx_load_ssl_client_cert(ENGINE_CTX *ctx, SSL *ssl,
+	STACK_OF(X509_NAME) *ca_dn, X509 **pcert, EVP_PKEY **pkey,
+	UI_METHOD *ui_method, void *callback_data);
 
 void ctx_log(ENGINE_CTX *ctx, int level, const char *format, ...)
 #ifdef __GNUC__

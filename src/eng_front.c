@@ -173,6 +173,37 @@ static EVP_PKEY *load_pubkey(ENGINE *engine, const char *s_key_id,
 	return ctx_load_pubkey(ctx, s_key_id, ui_method, callback_data);
 }
 
+static int load_ssl_client_cert(ENGINE *e, SSL *s,
+	STACK_OF(X509_NAME) *ca_dn, X509 **pcert, EVP_PKEY **ppkey,
+	STACK_OF(X509) **pother, UI_METHOD *ui_method, void *callback_data)
+{
+	int rc;
+	ENGINE_CTX *ctx;
+
+	*pcert = NULL;
+	*ppkey = NULL;
+	*pother = NULL;
+	if (e == NULL)
+		return 0;
+
+	ctx = get_ctx(e);
+	if (ctx == NULL)
+		return 0;
+
+	rc = ctx_load_ssl_client_cert(ctx, s, ca_dn, pcert, ppkey, ui_method,
+		callback_data);
+#ifdef EVP_F_EVP_PKEY_SET1_ENGINE
+	/* EVP_PKEY_set1_engine() is required for OpenSSL 1.1.x,
+	 * but otherwise setting pkey->engine breaks OpenSSL 1.0.2 */
+	if (*ppkey && !EVP_PKEY_set1_engine(*ppkey, e)) {
+		EVP_PKEY_free(*ppkey);
+		*ppkey = NULL;
+		return 0;
+	}
+#endif /* EVP_F_EVP_PKEY_SET1_ENGINE */
+	return 1;
+}
+
 static EVP_PKEY *load_privkey(ENGINE *engine, const char *s_key_id,
 		UI_METHOD *ui_method, void *callback_data)
 {
@@ -194,7 +225,7 @@ static EVP_PKEY *load_privkey(ENGINE *engine, const char *s_key_id,
 	return pkey;
 }
 
-static int engine_ctrl(ENGINE *engine, int cmd, long i, void *p, void (*f) ())
+static int engine_ctrl(ENGINE *engine, int cmd, long i, void *p, void (*f) (void))
 {
 	ENGINE_CTX *ctx;
 
@@ -233,6 +264,7 @@ static int bind_helper(ENGINE *e)
 #endif /* OPENSSL_VERSION_NUMBER */
 			!ENGINE_set_pkey_meths(e, PKCS11_pkey_meths) ||
 			!ENGINE_set_load_pubkey_function(e, load_pubkey) ||
+			!ENGINE_set_load_ssl_client_cert_function(e, load_ssl_client_cert) ||
 			!ENGINE_set_load_privkey_function(e, load_privkey)) {
 		return 0;
 	} else {

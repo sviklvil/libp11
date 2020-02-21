@@ -655,6 +655,253 @@ static int ctx_ctrl_load_cert(ENGINE_CTX *ctx, void *p)
 	return 1;
 }
 
+#define MAX_MESSAGE_LENGTH 256
+/*
+ * Return true if certificate issuer is listed in X509_NAME stack or if the
+ * stack is empty. Return false otherwise.
+ *
+ * @cert is a valid PKCS11 certificate
+ * @issuer_dns is a possibly empty stack of issuer names
+ */
+static int pkcs11_cert_issuer_matches(PKCS11_CERT *cert, STACK_OF(X509_NAME) *issuer_dns)
+{
+	int count;
+	int i;
+
+	if (NULL == issuer_dns)
+		return 1;
+	count = sk_X509_NAME_num(issuer_dns);
+	if (count <= 0)
+		return 1;
+	for (i = 0; i < count; i++) {
+		if (!X509_NAME_cmp(
+				sk_X509_NAME_value(issuer_dns, i),
+				X509_get_issuer_name(cert->x509)))
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * Check if certificate can be used by an SSL client.
+ *
+ * @cert is a valid PKCS11 certificate.
+ * @return 1 if the certificate purpose allowes that.
+ * @return 0 if the certificate purpose prohibits that.
+ * @return -1 in case of an error.
+ */
+static int pkcs11_cert_is_for_ssl_client(PKCS11_CERT *cert)
+{
+	/* XXX: We have to work on a temporary copy because
+	 * X509_check_purpose() modified the X509. */
+	X509 *copy = X509_dup(cert->x509);
+	int suitable;
+
+	if (NULL == copy)
+		return -1;
+	suitable = X509_check_purpose(copy, X509_PURPOSE_SSL_CLIENT, 0);
+	X509_free(copy);
+
+	return suitable;
+}
+
+/*
+ * Ask user to select a certificate from array of certificates if more
+ * certificates are listed. Otherwise selects the one certificate without
+ * asking.
+ *
+ * @certs is array of pointers to a PKCS11 certificate
+ * @cerrs_count is number of pointers in the array
+ * @ui_method is user interface to use to ask an user
+ * @callback_data are application data for the user interface
+ * @return selected certificate or NULL in case of an empty list or an error.
+ */
+static PKCS11_CERT *pkcs11_select_certificate(ENGINE_CTX* ctx,
+	PKCS11_CERT **certs, int certs_count, UI_METHOD *ui_method,
+	void *callback_data)
+{
+	UI *ui;
+	char message[MAX_MESSAGE_LENGTH];
+	int i;
+
+	/* No certificate list */
+	if (NULL == certs || 0 == certs_count)
+		return NULL;
+
+	/* Exactly one certificate */
+	if (1 == certs_count)
+		return certs[0];
+
+	/* More certificates, ask the user */
+	ui = UI_new();
+	if (ui == NULL) {
+		ctx_log(ctx, 0, "UI_new failed\n");
+		return NULL;
+	}
+	if (ui_method != NULL)
+		UI_set_method(ui, ui_method);
+	if (callback_data != NULL)
+		UI_add_user_data(ui, callback_data);
+
+	UI_add_info_string(ui, "Available certificates:\n");
+	for (i = 0; i < certs_count; i++) {
+		char *dn = NULL;
+		if (certs[i]->x509)
+			dn = X509_NAME_oneline(X509_get_subject_name
+					       (certs[i]->x509), NULL, 0);
+		snprintf(message, MAX_MESSAGE_LENGTH - 1, "%2u. %s (%s)\n",
+				i + 1, certs[i]->label, dn);
+		message[MAX_MESSAGE_LENGTH-1] = '\0';
+		UI_dup_info_string(ui, message);
+		if (dn) {
+			OPENSSL_free(dn);
+		}
+	}
+
+	message[0] = '\0';
+	if (!UI_add_input_string(ui, "Select certificate by number: ",
+		    UI_INPUT_FLAG_ECHO, message, 0, MAX_MESSAGE_LENGTH-1)) {
+		UI_free(ui);
+		ctx_log(ctx, 0, "UI_add_input_string failed\n");
+		return NULL;
+	}
+	if (UI_process(ui)) {
+		UI_free(ui);
+		ctx_log(ctx, 0, "UI_process failed\n");
+		return NULL;
+	}
+	UI_free(ui);
+
+	/* Parse the response */
+	i = atoi(message);
+	if (i < 1 || i > certs_count) {
+		ctx_log(ctx, 0, "Could not select a certificate because of wrong number\n");
+		return NULL;
+	}
+
+	return certs[i - 1];
+}
+
+int ctx_load_ssl_client_cert(ENGINE_CTX *ctx, SSL *ssl,
+	STACK_OF(X509_NAME) *ca_dn, X509 **pcert, EVP_PKEY **pkey,
+	UI_METHOD *ui_method, void *callback_data)
+{
+	PKCS11_SLOT *slot_list, *slot;
+	PKCS11_SLOT *found_slot = NULL;
+	PKCS11_TOKEN *tok;
+	PKCS11_CERT *certs, *selected_cert = NULL;
+	PKCS11_CERT **suitable_certs = NULL;
+	PKCS11_KEY *key;
+	//X509 *x509;
+
+	unsigned int slot_count, cert_count, n, suitable_certs_count;
+
+	/* Enumerate certificates */
+	if (PKCS11_enumerate_slots(ctx->pkcs11_ctx, &slot_list, &slot_count) < 0) {
+		ctx_log(ctx, 0, "Failed to enumerate slots\n");
+		return 0;
+	}
+	if (!(slot = PKCS11_find_token(ctx->pkcs11_ctx, slot_list, slot_count))) {
+		PKCS11_release_all_slots(ctx->pkcs11_ctx, slot_list, slot_count);
+		ctx_log(ctx, 0, "Didn't find any tokens\n");
+		return 0;
+	}
+	tok = slot->token;
+	if (tok == NULL) {
+		PKCS11_release_all_slots(ctx->pkcs11_ctx, slot_list, slot_count);
+		ctx_log(ctx, 0, "Found empty token\n");
+		return 0;
+	}
+
+	if (PKCS11_enumerate_certs(tok, &certs, &cert_count)) {
+		PKCS11_release_all_slots(ctx->pkcs11_ctx, slot_list, slot_count);
+		ctx_log(ctx, 0, "Unable to enumerate certificates\n");
+		return 0;
+	}
+
+	/* Select suitable certificates */
+	suitable_certs = malloc(cert_count * sizeof(*suitable_certs));
+	if (NULL == suitable_certs) {
+		PKCS11_release_all_slots(ctx->pkcs11_ctx, slot_list, slot_count);
+		ctx_log(ctx, 0, "Not enough memory to select certificates\n");
+		return 0;
+	}
+
+	for (n = 0, suitable_certs_count = 0; n < cert_count; n++) {
+		PKCS11_CERT *k = certs + n;
+		if (pkcs11_cert_issuer_matches(k, ca_dn)) {
+			int suitable = pkcs11_cert_is_for_ssl_client(k);
+			/* ???: Exclude expired certificates */
+			if (1 == suitable) {
+				/* Suitable certificate found */
+				suitable_certs[suitable_certs_count++] = k;
+			} else if (0 != suitable) {
+				free(suitable_certs);
+				PKCS11_release_all_slots(ctx->pkcs11_ctx, slot_list,
+					slot_count);
+				ctx_log(ctx, 0, "Error while checking if a certificate is "
+				"allowed for an SSL client\n");
+				return 0;
+			}
+		}
+	}
+
+	/* Let user to select if more certificates are suitable */
+	selected_cert = pkcs11_select_certificate(ctx, suitable_certs,
+		suitable_certs_count, ui_method, callback_data);
+	free(suitable_certs);
+
+	/* Store selected certificate */
+	if (NULL == selected_cert) {
+		PKCS11_release_all_slots(ctx->pkcs11_ctx, slot_list, slot_count);
+		ctx_log(ctx, 0, "No suitable certificate found\n");
+		return 0;
+	}
+	if (NULL != pcert) {
+		*pcert = X509_dup(selected_cert->x509);
+		if (NULL == *pcert) {
+			PKCS11_release_all_slots(ctx->pkcs11_ctx, slot_list, slot_count);
+			ctx_log(ctx, 0, "Could not copy selected certificate\n");
+			return 0;
+		}
+	}
+
+	if (NULL == pkey) {
+		/* No private key requested by an application */
+		PKCS11_release_all_slots(ctx->pkcs11_ctx, slot_list, slot_count);
+		return (1);
+	}
+
+	//TODO for vilis
+	//if (!ctx->force_login)
+
+	/* Find a private key corresponding to the certificate */
+	if (!ctx_login(ctx, slot, tok, ui_method, callback_data)) {
+		PKCS11_release_all_slots(ctx->pkcs11_ctx, slot_list, slot_count);
+		if (NULL != *pcert) {
+			X509_free(*pcert);
+			*pcert = NULL;
+		}
+		ctx_log(ctx, 0, "Could not log in to access private key corresponding to selected certificate\n");
+		return 0;
+	}
+	key = PKCS11_find_key(selected_cert);
+	if (NULL == key) {
+		PKCS11_release_all_slots(ctx->pkcs11_ctx, slot_list, slot_count);
+		if (NULL != *pcert) {
+			X509_free(*pcert);
+			*pcert = NULL;
+		}
+		ctx_log(ctx, 0, "Could not find private key corresponding to selected certificate\n");
+		return 0;
+	}
+	/* ???: Duplicate EVP_PKEY as the X509 */
+	*pkey = PKCS11_get_private_key(key);
+
+	PKCS11_release_all_slots(ctx->pkcs11_ctx, slot_list, slot_count);
+	return (1);
+}
+
 /******************************************************************************/
 /* Private and public key handling                                            */
 /******************************************************************************/
