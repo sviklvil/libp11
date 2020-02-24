@@ -663,7 +663,7 @@ static int ctx_ctrl_load_cert(ENGINE_CTX *ctx, void *p)
  * @cert is a valid PKCS11 certificate
  * @issuer_dns is a possibly empty stack of issuer names
  */
-static int pkcs11_cert_issuer_matches(PKCS11_CERT *cert, STACK_OF(X509_NAME) *issuer_dns)
+static int cert_issuer_matches(PKCS11_CERT *cert, STACK_OF(X509_NAME) *issuer_dns)
 {
 	int count;
 	int i;
@@ -690,7 +690,7 @@ static int pkcs11_cert_issuer_matches(PKCS11_CERT *cert, STACK_OF(X509_NAME) *is
  * @return 0 if the certificate purpose prohibits that.
  * @return -1 in case of an error.
  */
-static int pkcs11_cert_is_for_ssl_client(PKCS11_CERT *cert)
+static int cert_is_for_ssl_client(PKCS11_CERT *cert)
 {
 	/* XXX: We have to work on a temporary copy because
 	 * X509_check_purpose() modified the X509. */
@@ -716,7 +716,7 @@ static int pkcs11_cert_is_for_ssl_client(PKCS11_CERT *cert)
  * @callback_data are application data for the user interface
  * @return selected certificate or NULL in case of an empty list or an error.
  */
-static PKCS11_CERT *pkcs11_select_certificate(ENGINE_CTX* ctx,
+static PKCS11_CERT *select_certificate(ENGINE_CTX* ctx,
 	PKCS11_CERT **certs, int certs_count, UI_METHOD *ui_method,
 	void *callback_data)
 {
@@ -796,7 +796,6 @@ int ctx_load_ssl_client_cert(ENGINE_CTX *ctx, SSL *ssl,
 
 	unsigned int slot_count, cert_count, n, suitable_certs_count;
 
-	/* Enumerate certificates */
 	if (PKCS11_enumerate_slots(ctx->pkcs11_ctx, &slot_list, &slot_count) < 0) {
 		ctx_log(ctx, 0, "Failed to enumerate slots\n");
 		return 0;
@@ -810,6 +809,13 @@ int ctx_load_ssl_client_cert(ENGINE_CTX *ctx, SSL *ssl,
 	if (tok == NULL) {
 		PKCS11_release_all_slots(ctx->pkcs11_ctx, slot_list, slot_count);
 		ctx_log(ctx, 0, "Found empty token\n");
+		return 0;
+	}
+
+	/* In some tokens certificates can be marked as private */
+	if (!ctx_login(ctx, slot, tok,
+		ctx->ui_method, ctx->callback_data)) {
+		ctx_log(ctx, 0, "Login to token failed, returning NULL...\n");
 		return 0;
 	}
 
@@ -829,8 +835,8 @@ int ctx_load_ssl_client_cert(ENGINE_CTX *ctx, SSL *ssl,
 
 	for (n = 0, suitable_certs_count = 0; n < cert_count; n++) {
 		PKCS11_CERT *k = certs + n;
-		if (pkcs11_cert_issuer_matches(k, ca_dn)) {
-			int suitable = pkcs11_cert_is_for_ssl_client(k);
+		if (cert_issuer_matches(k, ca_dn)) {
+			int suitable = cert_is_for_ssl_client(k);
 			/* ???: Exclude expired certificates */
 			if (1 == suitable) {
 				/* Suitable certificate found */
@@ -847,7 +853,7 @@ int ctx_load_ssl_client_cert(ENGINE_CTX *ctx, SSL *ssl,
 	}
 
 	/* Let user to select if more certificates are suitable */
-	selected_cert = pkcs11_select_certificate(ctx, suitable_certs,
+	selected_cert = select_certificate(ctx, suitable_certs,
 		suitable_certs_count, ui_method, callback_data);
 	free(suitable_certs);
 
@@ -871,9 +877,6 @@ int ctx_load_ssl_client_cert(ENGINE_CTX *ctx, SSL *ssl,
 		PKCS11_release_all_slots(ctx->pkcs11_ctx, slot_list, slot_count);
 		return (1);
 	}
-
-	//TODO for vilis
-	//if (!ctx->force_login)
 
 	/* Find a private key corresponding to the certificate */
 	if (!ctx_login(ctx, slot, tok, ui_method, callback_data)) {
