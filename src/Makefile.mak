@@ -18,7 +18,7 @@ TARGETS = $(LIBP11_TARGET) $(PKCS11_TARGET)
 all: $(TARGETS)
 
 clean:
-	del $(OBJECTS) $(TARGETS) *.lib *.exp *.def *.res
+	del $(OBJECTS) $(TARGETS) *.lib libp11.exp pkcs11.exp *.def *.res
 
 .rc.res:
 	rc /r /fo$@ $<
